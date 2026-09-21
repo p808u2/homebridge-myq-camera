@@ -118,6 +118,10 @@ export class SharedCameraSession extends EventEmitter {
   private session?: MyqCameraSession;
   private opening?: MyqCameraSession;
   private pending?: Promise<MyqCameraSession>;
+  private noVideoTimer?: NodeJS.Timeout;
+  private recovery?: Promise<void>;
+  private recoveryAttempts = 0;
+  private readonly maxRecoveryAttempts = 3;
   private consumers = 0;
   private idleTimer?: NodeJS.Timeout;
   private closed = false;
@@ -145,6 +149,14 @@ export class SharedCameraSession extends EventEmitter {
   /** True while the underlying camera session is open (streaming or warm). */
   get open(): boolean {
     return this.session !== undefined;
+  }
+
+  get consumerCount(): number {
+    return this.consumers;
+  }
+
+  resetStaleWarmSession(): void {
+    if (this.consumers === 0 && this.session) this.teardown();
   }
 
   get hasAudio(): boolean {
@@ -230,10 +242,64 @@ export class SharedCameraSession extends EventEmitter {
     session.removeListener('error', onOpenError);
     if (this.opening === session) this.opening = undefined;
     this.session = session;
+    // Seedonk can report a completed handshake before any media arrives. The
+    // first-frame watchdog is deliberately started only after adoption, so an
+    // open-time race cannot reset a session that is not yet shared.
+    this.noVideoTimer = setTimeout(() => {
+      this.noVideoTimer = undefined;
+      if (this.session === session) {
+        this.log.warn('myQ shared camera session connected without video; recovering');
+        void this.recoverSilentSession(session);
+      }
+    }, 10_000);
     return session;
   }
 
+  /**
+   * Replace a handshake-only session without dropping active HomeKit consumers.
+   * Do not use teardown(): it clears the reference count and would make an
+   * in-flight HomeKit request lose ownership while recovery is still pending.
+   */
+  private async recoverSilentSession(session: MyqCameraSession): Promise<void> {
+    if (this.session !== session || this.closed || this.recovery) return;
+    // Bound recovery so a camera that is genuinely offline cannot create an
+    // endless reconnect loop or keep HomeKit requests alive forever.
+    if (this.recoveryAttempts >= this.maxRecoveryAttempts) {
+      this.log.error('myQ shared camera session remained silent after automatic recovery attempts');
+      this.teardown();
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', new Error('myQ camera connected but produced no video'));
+      }
+      return;
+    }
+    this.recoveryAttempts += 1;
+    this.recovery = (async () => {
+      session.close();
+      this.session = undefined;
+      this.log.warn(`myQ shared camera session recovering silent session (attempt ${this.recoveryAttempts}/${this.maxRecoveryAttempts})`);
+      // After a power-cycle the camera may still be releasing its previous
+      // relay state; a short gap avoids repeating the same failed handshake.
+      await delay(2_000);
+      if (this.closed || this.consumers === 0) return;
+      this.pending = this.openInternal();
+      try {
+        await this.pending;
+      } catch (error) {
+        if (this.listenerCount('error') > 0) this.emit('error', error);
+      } finally {
+        this.pending = undefined;
+      }
+    })();
+    try { await this.recovery; } finally { this.recovery = undefined; }
+  }
+
   private readonly onVideo = (frame: Buffer): void => {
+    if (this.noVideoTimer) {
+      clearTimeout(this.noVideoTimer);
+      this.noVideoTimer = undefined;
+      this.log.info('myQ shared camera session received first video frame');
+    }
+    this.recoveryAttempts = 0;
     let idr = false;
     const units = nals(frame);
     for (const unit of units) {
@@ -298,6 +364,10 @@ export class SharedCameraSession extends EventEmitter {
   }
 
   private teardown(): void {
+    if (this.noVideoTimer) {
+      clearTimeout(this.noVideoTimer);
+      this.noVideoTimer = undefined;
+    }
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = undefined;

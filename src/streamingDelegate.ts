@@ -393,6 +393,11 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       const elapsed = secondsLabel(Date.now() - startedAt);
       if (error) {
         this.log.warn(`Snapshot refresh failed for ${this.cameraConfig.name} after ${elapsed}: ${describeError(error)}`);
+        if (error.message === 'snapshot timeout' && !acquireSession
+          && this.shared.consumerCount === 0 && this.shared.open) {
+          this.log.warn(`Snapshot refresh for ${this.cameraConfig.name} reset stale warm camera session`);
+          this.shared.resetStaleWarmSession();
+        }
       } else if (image) {
         this.log.info(`Snapshot refresh completed for ${this.cameraConfig.name} after ${elapsed} (${image.length} bytes)`);
       } else {
@@ -744,6 +749,10 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         if (!pendingAcquireReleased) this.shared.release();
         this.log.info(`HomeKit stream for ${this.cameraConfig.name} acquired after cleanup; not starting FFmpeg`);
         return;
+      }
+      if (!this.shared.open && !cleaned) {
+        this.log.warn(`HomeKit stream for ${this.cameraConfig.name} acquired a reset session; retrying once`);
+        await this.shared.acquire();
       }
       acquired = true;
       this.log.info(`HomeKit stream for ${this.cameraConfig.name} acquired shared camera session`);

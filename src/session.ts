@@ -242,6 +242,9 @@ export class SharedCameraSession extends EventEmitter {
     session.removeListener('error', onOpenError);
     if (this.opening === session) this.opening = undefined;
     this.session = session;
+    // Seedonk can report a completed handshake before any media arrives. The
+    // first-frame watchdog is deliberately started only after adoption, so an
+    // open-time race cannot reset a session that is not yet shared.
     this.noVideoTimer = setTimeout(() => {
       this.noVideoTimer = undefined;
       if (this.session === session) {
@@ -252,9 +255,15 @@ export class SharedCameraSession extends EventEmitter {
     return session;
   }
 
-  /** Replace a handshake-only session without dropping active HomeKit consumers. */
+  /**
+   * Replace a handshake-only session without dropping active HomeKit consumers.
+   * Do not use teardown(): it clears the reference count and would make an
+   * in-flight HomeKit request lose ownership while recovery is still pending.
+   */
   private async recoverSilentSession(session: MyqCameraSession): Promise<void> {
     if (this.session !== session || this.closed || this.recovery) return;
+    // Bound recovery so a camera that is genuinely offline cannot create an
+    // endless reconnect loop or keep HomeKit requests alive forever.
     if (this.recoveryAttempts >= this.maxRecoveryAttempts) {
       this.log.error('myQ shared camera session remained silent after automatic recovery attempts');
       this.teardown();
@@ -268,6 +277,8 @@ export class SharedCameraSession extends EventEmitter {
       session.close();
       this.session = undefined;
       this.log.warn(`myQ shared camera session recovering silent session (attempt ${this.recoveryAttempts}/${this.maxRecoveryAttempts})`);
+      // After a power-cycle the camera may still be releasing its previous
+      // relay state; a short gap avoids repeating the same failed handshake.
       await delay(2_000);
       if (this.closed || this.consumers === 0) return;
       this.pending = this.openInternal();

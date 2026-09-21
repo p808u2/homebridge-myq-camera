@@ -393,6 +393,8 @@ export class StreamingDelegate implements CameraStreamingDelegate {
       const elapsed = secondsLabel(Date.now() - startedAt);
       if (error) {
         this.log.warn(`Snapshot refresh failed for ${this.cameraConfig.name} after ${elapsed}: ${describeError(error)}`);
+        // Only reset an idle warm session: an active viewer owns the session
+        // and must not be disrupted by a passive snapshot timeout.
         if (error.message === 'snapshot timeout' && !acquireSession
           && this.shared.consumerCount === 0 && this.shared.open) {
           this.log.warn(`Snapshot refresh for ${this.cameraConfig.name} reset stale warm camera session`);
@@ -750,6 +752,9 @@ export class StreamingDelegate implements CameraStreamingDelegate {
         this.log.info(`HomeKit stream for ${this.cameraConfig.name} acquired after cleanup; not starting FFmpeg`);
         return;
       }
+      // The no-video watchdog may have replaced the session while acquire()
+      // was resolving. Reacquire once rather than starting FFmpeg on a dead
+      // session; the shared recovery remains single-flight.
       if (!this.shared.open && !cleaned) {
         this.log.warn(`HomeKit stream for ${this.cameraConfig.name} acquired a reset session; retrying once`);
         await this.shared.acquire();
